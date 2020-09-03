@@ -38,7 +38,8 @@ class h_sigmoid(nn.Module):
         self.relu = nn.ReLU6(inplace=inplace)
 
     def forward(self, x):
-        return self.relu(x + 3) / 6
+        # return self.relu(x + 3) / 6
+        return self.relu(x + 3) * 0.16666667
 
 
 class h_swish(nn.Module):
@@ -55,10 +56,10 @@ class SELayer(nn.Module):
         super(SELayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-                nn.Linear(channel, _make_divisible(channel // reduction, 8)),
-                nn.ReLU(inplace=True),
-                nn.Linear(_make_divisible(channel // reduction, 8), channel),
-                h_sigmoid()
+            nn.Linear(channel, _make_divisible(channel // reduction, 8)),
+            nn.ReLU(inplace=True),
+            nn.Linear(_make_divisible(channel // reduction, 8), channel),
+            h_sigmoid()
         )
 
     def forward(self, x):
@@ -67,20 +68,36 @@ class SELayer(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
+class SELayerWithConv(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super(SELayerWithConv, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channel, _make_divisible(channel // reduction, 8), 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(_make_divisible(channel // reduction, 8), channel, 1),
+            h_sigmoid()
+        )
 
-def conv_3x3_bn(inp, oup, stride):
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = x.mean(3, keepdim=True).mean(2, keepdim=True)
+        y = self.fc(y)
+        return x * y
+
+def conv_3x3_bn(inp, oup, stride, no_h_swish=False):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
         nn.BatchNorm2d(oup),
-        h_swish()
+        h_swish() if not no_h_swish else nn.ReLU(inplace=True),
     )
 
 
-def conv_1x1_bn(inp, oup):
+def conv_1x1_bn(inp, oup, no_h_swish=False):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
         nn.BatchNorm2d(oup),
-        h_swish()
+        h_swish() if not no_h_swish else nn.ReLU(inplace=True),
     )
 
 
@@ -94,11 +111,12 @@ class InvertedResidual(nn.Module):
         if inp == hidden_dim:
             self.conv = nn.Sequential(
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim, bias=False),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride,
+                          (kernel_size - 1) // 2, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 h_swish() if use_hs else nn.ReLU(inplace=True),
                 # Squeeze-and-Excite
-                SELayer(hidden_dim) if use_se else nn.Identity(),
+                SELayerWithConv(hidden_dim) if use_se else nn.Identity(),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
@@ -110,10 +128,11 @@ class InvertedResidual(nn.Module):
                 nn.BatchNorm2d(hidden_dim),
                 h_swish() if use_hs else nn.ReLU(inplace=True),
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim, bias=False),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride,
+                          (kernel_size - 1) // 2, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 # Squeeze-and-Excite
-                SELayer(hidden_dim) if use_se else nn.Identity(),
+                SELayerWithConv(hidden_dim) if use_se else nn.Identity(),
                 h_swish() if use_hs else nn.ReLU(inplace=True),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
@@ -128,7 +147,7 @@ class InvertedResidual(nn.Module):
 
 
 class MobileNetV3(nn.Module):
-    def __init__(self, cfgs, mode, num_classes=1000, width_mult=1.):
+    def __init__(self, cfgs, mode, num_classes=1000, width_mult=1., no_h_swish=False):
         super(MobileNetV3, self).__init__()
         # setting of inverted residual blocks
         self.cfgs = cfgs
@@ -136,23 +155,25 @@ class MobileNetV3(nn.Module):
 
         # building first layer
         input_channel = _make_divisible(16 * width_mult, 8)
-        layers = [conv_3x3_bn(3, input_channel, 2)]
+        layers = [conv_3x3_bn(3, input_channel, 2, no_h_swish=no_h_swish)]
         # building inverted residual blocks
         block = InvertedResidual
         for k, t, c, use_se, use_hs, s in self.cfgs:
             output_channel = _make_divisible(c * width_mult, 8)
             exp_size = _make_divisible(input_channel * t, 8)
-            layers.append(block(input_channel, exp_size, output_channel, k, s, use_se, use_hs))
+            layers.append(block(input_channel, exp_size,
+                                output_channel, k, s, use_se, use_hs))
             input_channel = output_channel
         self.features = nn.Sequential(*layers)
         # building last several layers
-        self.conv = conv_1x1_bn(input_channel, exp_size)
+        self.conv = conv_1x1_bn(input_channel, exp_size, no_h_swish=no_h_swish)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         output_channel = {'large': 1280, 'small': 1024}
-        output_channel = _make_divisible(output_channel[mode] * width_mult, 8) if width_mult > 1.0 else output_channel[mode]
+        output_channel = _make_divisible(
+            output_channel[mode] * width_mult, 8) if width_mult > 1.0 else output_channel[mode]
         self.classifier = nn.Sequential(
             nn.Linear(exp_size, output_channel),
-            h_swish(),
+            h_swish() if not no_h_swish else nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(output_channel, num_classes),
         )
@@ -182,13 +203,14 @@ class MobileNetV3(nn.Module):
                 m.weight.data.normal_(0, 0.01)
                 m.bias.data.zero_()
 
-
+# official: achieves 74.6% using 8 GPU setup and 75.2% using 2x2 TPU setup
+# https://github.com/tensorflow/models/blob/f2c76e41f668b30cc6714ed8a866c07cc2f2275a/research/slim/nets/mobilenet/mobilenet_v3.py#L472
 def mobilenetv3_large(**kwargs):
     """
     Constructs a MobileNetV3-Large model
     """
     cfgs = [
-        # k, t, c, SE, HS, s 
+        # k, t, c, SE, HS, s
         [3,   1,  16, 0, 0, 1],
         [3,   4,  24, 0, 0, 2],
         [3,   3,  24, 0, 0, 1],
@@ -207,13 +229,35 @@ def mobilenetv3_large(**kwargs):
     ]
     return MobileNetV3(cfgs, mode='large', **kwargs)
 
+# official: 72.2%, https://github.com/tensorflow/models/blob/f2c76e41f668b30cc6714ed8a866c07cc2f2275a/research/slim/nets/mobilenet/mobilenet_v3.py#L502
+def mobilenetv3_large_minimalistic(**kwargs):
+    cfgs = [
+        # k, t, c, SE, HS, s
+        [3,   1,  16, 0, 0, 1],
+        [3,   4,  24, 0, 0, 2],
+        [3,   3,  24, 0, 0, 1],
+        [5,   3,  40, 0, 0, 2],
+        [5,   3,  40, 0, 0, 1],
+        [5,   3,  40, 0, 0, 1],
+        [3,   6,  80, 0, 0, 2],
+        [3, 2.5,  80, 0, 0, 1],
+        [3, 2.3,  80, 0, 0, 1],
+        [3, 2.3,  80, 0, 0, 1],
+        [3,   6, 112, 0, 0, 1],
+        [3,   6, 112, 0, 0, 1],
+        [3,   6, 160, 0, 0, 2],
+        [3,   6, 160, 0, 0, 1],
+        [3,   6, 160, 0, 0, 1]
+    ]
+    return MobileNetV3(cfgs, mode='large', no_h_swish=True, **kwargs)
 
+# official: 67.5, https://github.com/tensorflow/models/blob/f2c76e41f668b30cc6714ed8a866c07cc2f2275a/research/slim/nets/mobilenet/mobilenet_v3.py#L532
 def mobilenetv3_small(**kwargs):
     """
     Constructs a MobileNetV3-Small model
     """
     cfgs = [
-        # k, t, c, SE, HS, s 
+        # k, t, c, SE, HS, s
         [3,    1,  16, 1, 0, 2],
         [3,  4.5,  24, 0, 0, 2],
         [3, 3.67,  24, 0, 0, 1],
@@ -229,3 +273,40 @@ def mobilenetv3_small(**kwargs):
 
     return MobileNetV3(cfgs, mode='small', **kwargs)
 
+# official: 62%, https://github.com/tensorflow/models/blob/f2c76e41f668b30cc6714ed8a866c07cc2f2275a/research/slim/nets/mobilenet/mobilenet_v3.py#L557
+def mobilenetv3_small_minimalistic(**kwargs):
+    cfgs = [
+        # k, t, c, SE, HS, s
+        [3,    1,  16, 0, 0, 2],
+        [3,  4.5,  24, 0, 0, 2],
+        [3, 3.67,  24, 0, 0, 1],
+        [3,    4,  40, 0, 0, 2],
+        [3,    6,  40, 0, 0, 1],
+        [3,    6,  40, 0, 0, 1],
+        [3,    3,  48, 0, 0, 1],
+        [3,    3,  48, 0, 0, 1],
+        [3,    6,  96, 0, 0, 2],
+        [3,    6,  96, 0, 0, 1],
+        [3,    6,  96, 0, 0, 1],
+    ]
+
+    return MobileNetV3(cfgs, mode='small', no_h_swish=True, **kwargs)
+
+
+if __name__ == "__main__":
+    import torch
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ''
+    x = torch.Tensor(1, 3, 224, 224)
+
+    for func in [mobilenetv3_large, mobilenetv3_large_minimalistic, mobilenetv3_small, mobilenetv3_small_minimalistic]:
+        print(func.__name__)
+        net = func()
+        net.eval()
+
+        trace_model = torch.jit.trace(net, x)
+        trace_model.save("pretrained/{}.jit".format(func.__name__))
+
+        del net, trace_model
+
+    exit()
